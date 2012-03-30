@@ -9,6 +9,7 @@ var keyCounter = {};
 var counters = {};
 var timers = {};
 var gauges = {};
+var locations = [];
 var debugInt, flushInt, keyFlushInt, server, mgmtServer;
 var startup_time = Math.round(new Date().getTime() / 1000);
 
@@ -77,6 +78,8 @@ config.configFile(process.argv[2], function (config, oldConfig) {
           timers[key].push(Number(fields[0] || 0));
         } else if (fields[1].trim() == "g") {
           gauges[key] = Number(fields[0] || 0);
+        } else if (fields[1].trim() == "l") {
+          locations.push([key, fields]);
         } else {
           if (fields[2] && fields[2].match(/^@([\d\.]+)/)) {
             sampleRate = Number(fields[2].match(/^@([\d\.]+)/)[1]);
@@ -277,11 +280,36 @@ config.configFile(process.argv[2], function (config, oldConfig) {
             this.end();
             stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
           });
+        } catch(e){
+          if (config.debug) {
+            util.log(e);
+          }
+          stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
+        }
+      }
 
+      if (config.leftronicAccessKey) {
+        try {
           var data = {
             accessKey: config.leftronicAccessKey,
             streams: []
           };
+
+          locations.forEach(function(keyFields) {
+            var key = keyFields[0];
+            var fields = keyFields[1];
+            var location = fields[0].split('/');
+            var latitude = parseFloat(location[0], 10);
+            var longitude = parseFloat(location[1], 10);
+
+            data.streams.push({
+              streamName: key,
+              point: {
+                latitude: latitude,
+                longitude: longitude
+              }
+            });
+          });
 
           for (key in statsCounts) {
             var value = statsCounts[key];
@@ -342,6 +370,8 @@ config.configFile(process.argv[2], function (config, oldConfig) {
           stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
         }
       }
+
+      locations = [];
 
     }, flushInterval);
 
