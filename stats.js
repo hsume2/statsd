@@ -4,6 +4,7 @@ var dgram  = require('dgram')
   , config = require('./config')
   , fs     = require('fs')
   , https   = require('https')
+  , geocoder = require('geocoder')
 
 var keyCounter = {};
 var counters = {};
@@ -192,6 +193,90 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       pctThreshold = [ pctThreshold ]; // listify percentiles so single values work the same
     }
 
+    var flushLeftronic = function(streams) {
+      try {
+        var data = {
+          accessKey: config.leftronicAccessKey,
+          streams: streams || []
+        };
+
+        if (config.debug) {
+          util.log(JSON.stringify(streams));
+        }
+
+        var json = JSON.stringify(data);
+        var options = {
+          host: 'www.leftronic.com',
+          path: '/customSend/',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': json.length
+          }
+        };
+        var leftronic = https.request(options, function(response) {
+          response.setEncoding('utf8');
+          response.on('data', function() {
+            leftronic.end();
+            stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
+          });
+        });
+        leftronic.on('error', function(connectionException) {
+          if (config.debug) {
+            util.log(connectionException);
+          }
+        });
+        leftronic.write(json);
+      } catch(e){
+        if (config.debug) {
+          util.log(e);
+        }
+        stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
+      }
+    };
+
+    var storedLocations = {}, fetchingLocations = {};
+    var memoizedGeolocation = function(options) {
+      var location = options.location;
+      var fetch = options.fetch;
+      var callback = options.callback;
+      var result = storedLocations[location];
+      if (!result) {
+        if (config.debug) {
+          util.log('Geolocation miss,' + location);
+        }
+        var fetching = fetchingLocations[location];
+        if (fetching) {
+          if (config.debug) {
+            util.log('Geolocation already fetching,' + location);
+          }
+          fetchingLocations[location].push(callback);
+        } else {
+          if (config.debug) {
+            util.log('Geolocation fetch,' + location);
+          }
+          fetchingLocations[location] = [callback];
+          fetch && fetch(location, function(result) {
+            if (config.debug) {
+              util.log('Geolocation fetched,' + location + ', ' + JSON.stringify(result));
+            }
+            storedLocations[location] = result;
+            if(fetchingLocations[location]) {
+              fetchingLocations[location].forEach(function(cb) {
+                cb && cb(result);
+              });
+              delete fetchingLocations[location];
+            }
+          });
+        }
+      } else {
+        if (config.debug) {
+          util.log('Geolocation hit,' + location + ', ' + JSON.stringify(result));
+        }
+        callback && callback(result);
+      }
+    }
+
     flushInt = setInterval(function () {
       var statString = '';
       var ts = Math.round(new Date().getTime() / 1000);
@@ -289,86 +374,84 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       }
 
       if (config.leftronicAccessKey) {
-        try {
-          var data = {
-            accessKey: config.leftronicAccessKey,
-            streams: []
-          };
+        var streams = [];
 
-          locations.forEach(function(keyFields) {
-            var key = keyFields[0];
-            var fields = keyFields[1];
-            var location = fields[0].split('/');
-            var latitude = parseFloat(location[0], 10);
-            var longitude = parseFloat(location[1], 10);
+        locations.forEach(function(keyFields) {
+          var key = keyFields[0];
+          var fields = keyFields[1];
+          var location = fields[0];
 
-            data.streams.push({
+          if (location.match(/\(.+?,.+?\)/)) {
+            var match = location.match(/\(:?(.+?),(.+?)\)/);
+            var latitude = parseFloat(match[1], 10);
+            var longitude = parseFloat(match[2], 10);
+
+            streams.push({
               streamName: key,
               point: {
                 latitude: latitude,
                 longitude: longitude
               }
             });
-          });
-
-          for (key in statsCounts) {
-            var value = statsCounts[key];
-            var aggregations = config.aggregations;
-            if (aggregations) {
-              for (replacement in aggregations) {
-                var matcher = aggregations[replacement];
-                if (key.match(matcher)) {
-                  var newKey = key.replace(matcher, replacement);
-                  if (!statsCounts[newKey]) {
-                    statsCounts[newKey] = 0;
+          } else {
+            memoizedGeolocation({
+              location: location,
+              fetch: function(loc, callback) {
+                geocoder.geocode(loc, function (err, response) {
+                  if (response.status === 'OK') {
+                    var results = response.results;
+                    var result = results[0];
+                    if(result && result.geometry && result.geometry.location) {
+                      callback(result.geometry.location);
+                    }
+                  } else {
+                    if (config.debug) {
+                      util.log('Geolocation failed:', err);
+                    }
                   }
-                  statsCounts[newKey] += value;
+                });
+              },
+              callback: function(latLong) {
+                var streams = [];
+                streams.push({
+                  streamName: key,
+                  point: {
+                    latitude: latLong.lat,
+                    longitude: latLong.lng
+                  }
+                });
+                flushLeftronic(streams);
+              }
+            });
+          }
+        });
+
+        for (key in statsCounts) {
+          var value = statsCounts[key];
+          var aggregations = config.aggregations;
+          if (aggregations) {
+            for (replacement in aggregations) {
+              var matcher = aggregations[replacement];
+              if (key.match(matcher)) {
+                var newKey = key.replace(matcher, replacement);
+                if (!statsCounts[newKey]) {
+                  statsCounts[newKey] = 0;
                 }
+                statsCounts[newKey] += value;
               }
             }
           }
-
-          for (key in statsCounts) {
-            var value = statsCounts[key];
-            data.streams.push({
-              streamName: key,
-              point: value
-            });
-          }
-
-          if (config.debug) {
-            util.log(JSON.stringify(data.streams));
-          }
-
-          var json = JSON.stringify(data);
-          var options = {
-            host: 'www.leftronic.com',
-            path: '/customSend/',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Content-Length': json.length
-            }
-          };
-          var leftronic = https.request(options, function(response) {
-            response.setEncoding('utf8');
-            response.on('data', function() {
-              leftronic.end();
-              stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
-            });
-          });
-          leftronic.on('error', function(connectionException) {
-            if (config.debug) {
-              util.log(connectionException);
-            }
-          });
-          leftronic.write(json);
-        } catch(e){
-          if (config.debug) {
-            util.log(e);
-          }
-          stats['graphite']['last_exception'] = Math.round(new Date().getTime() / 1000);
         }
+
+        for (key in statsCounts) {
+          var value = statsCounts[key];
+          streams.push({
+            streamName: key,
+            point: value
+          });
+        }
+
+        flushLeftronic(streams);
       }
 
       locations = [];
