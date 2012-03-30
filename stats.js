@@ -277,6 +277,25 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       }
     }
 
+    var aggregateLocation = function(streams, key, latitude, longitude) {
+      var aggregations = config.aggregations;
+      if (aggregations) {
+        for (replacement in aggregations) {
+          var matcher = aggregations[replacement];
+          if (key.match(matcher)) {
+            var newKey = key.replace(matcher, replacement);
+            streams.push({
+              streamName: newKey,
+              point: {
+                latitude: latitude,
+                longitude: longitude
+              }
+            });
+          }
+        }
+      }
+    }
+
     flushInt = setInterval(function () {
       var statString = '';
       var ts = Math.round(new Date().getTime() / 1000);
@@ -393,6 +412,7 @@ config.configFile(process.argv[2], function (config, oldConfig) {
                 longitude: longitude
               }
             });
+            aggregateLocation(streams, key, latitude, longitude);
           } else {
             memoizedGeolocation({
               location: location,
@@ -420,6 +440,7 @@ config.configFile(process.argv[2], function (config, oldConfig) {
                     longitude: latLong.lng
                   }
                 });
+                aggregateLocation(streams, key, latLong.lat, latLong.lng);
                 flushLeftronic(streams);
               }
             });
