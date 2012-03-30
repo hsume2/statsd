@@ -3,6 +3,7 @@ var dgram  = require('dgram')
   , net    = require('net')
   , config = require('./config')
   , fs     = require('fs')
+  , https   = require('https')
 
 var keyCounter = {};
 var counters = {};
@@ -193,6 +194,7 @@ config.configFile(process.argv[2], function (config, oldConfig) {
       var ts = Math.round(new Date().getTime() / 1000);
       var numStats = 0;
       var key;
+      var statsCounts = {};
 
       for (key in counters) {
         var value = counters[key];
@@ -200,6 +202,8 @@ config.configFile(process.argv[2], function (config, oldConfig) {
 
         statString += 'stats.'        + key + ' ' + valuePerSecond + ' ' + ts + "\n";
         statString += 'stats_counts.' + key + ' ' + value          + ' ' + ts + "\n";
+
+        statsCounts[key] = value;
 
         counters[key] = 0;
         numStats += 1;
@@ -273,6 +277,64 @@ config.configFile(process.argv[2], function (config, oldConfig) {
             this.end();
             stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
           });
+
+          var data = {
+            accessKey: config.leftronicAccessKey,
+            streams: []
+          };
+
+          for (key in statsCounts) {
+            var value = statsCounts[key];
+            var aggregations = config.aggregations;
+            if (aggregations) {
+              for (replacement in aggregations) {
+                var matcher = aggregations[replacement];
+                if (key.match(matcher)) {
+                  var newKey = key.replace(matcher, replacement);
+                  if (!statsCounts[newKey]) {
+                    statsCounts[newKey] = 0;
+                  }
+                  statsCounts[newKey] += value;
+                }
+              }
+            }
+          }
+
+          for (key in statsCounts) {
+            var value = statsCounts[key];
+            data.streams.push({
+              streamName: key,
+              point: value
+            });
+          }
+
+          if (config.debug) {
+            util.log(JSON.stringify(data.streams));
+          }
+
+          var json = JSON.stringify(data);
+          var options = {
+            host: 'www.leftronic.com',
+            path: '/customSend/',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': json.length
+            }
+          };
+          var leftronic = https.request(options, function(response) {
+            response.setEncoding('utf8');
+            response.on('data', function() {
+              leftronic.end();
+              stats['graphite']['last_flush'] = Math.round(new Date().getTime() / 1000);
+            });
+          });
+          leftronic.on('error', function(connectionException) {
+            if (config.debug) {
+              util.log(connectionException);
+            }
+          });
+          leftronic.write(json);
         } catch(e){
           if (config.debug) {
             util.log(e);
